@@ -5,6 +5,31 @@ param(
     [switch]$LocalOnly
 )
 $ErrorActionPreference = 'Stop'
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $stream = [IO.File]::OpenRead($LiteralPath)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $sha256.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Test-RedirectingLink {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+    $item = Get-Item -LiteralPath $LiteralPath -Force
+    $target = @($item.Target) -join ''
+    return $item.LinkType -in @('SymbolicLink', 'Junction') -or ![string]::IsNullOrWhiteSpace($target)
+}
+
 $cfg = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
 $receipt = Get-Content -LiteralPath $Review -Raw | ConvertFrom-Json
 $source = (Resolve-Path -LiteralPath $Report).Path
@@ -13,7 +38,7 @@ if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*\.md$') { throw 'Use a simple Ma
 if ($receipt.verdict -cne 'PASS' -or $receipt.directorApproved -isnot [bool] -or !$receipt.directorApproved -or !$receipt.evidence) {
     throw 'Publication requires PASS, Director approval and review evidence.'
 }
-$hash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+$hash = Get-Sha256Hex -LiteralPath $source
 if ($hash -ine $receipt.sha256) { throw 'Report changed or approval hash is missing. Request a fresh review.' }
 $body = Get-Content -LiteralPath $source -Raw
 if ([string]::IsNullOrWhiteSpace($body)) { throw 'Report is empty.' }
@@ -33,13 +58,13 @@ $obsidianTarget = Join-Path $obsidianDir $name
 # Existing notes and linked directories are not overwritten or followed.
 foreach ($directory in @((Join-Path $repo 'reports'), $obsidianDir)) {
     if (Test-Path -LiteralPath $directory) {
-        if ((Get-Item -LiteralPath $directory).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Linked output directory refused: $directory" }
+        if (Test-RedirectingLink -LiteralPath $directory) { throw "Linked output directory refused: $directory" }
     }
 }
 foreach ($target in @($gitTarget, $obsidianTarget)) {
     if (Test-Path -LiteralPath $target) {
-        if ((Get-Item -LiteralPath $target).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Linked output file refused.' }
-        if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ine $hash) { throw "Existing different report refused: $target" }
+        if (Test-RedirectingLink -LiteralPath $target) { throw 'Linked output file refused.' }
+        if ((Get-Sha256Hex -LiteralPath $target) -ine $hash) { throw "Existing different report refused: $target" }
     }
 }
 if (!$LocalOnly) {
@@ -51,7 +76,7 @@ if (!$LocalOnly) {
 New-Item -ItemType Directory -Path (Split-Path $gitTarget), $obsidianDir -Force | Out-Null
 foreach ($target in @($gitTarget, $obsidianTarget)) {
     if (!(Test-Path -LiteralPath $target)) { Copy-Item -LiteralPath $source -Destination $target }
-    if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ine $hash) { throw 'Output verification failed.' }
+    if ((Get-Sha256Hex -LiteralPath $target) -ine $hash) { throw 'Output verification failed.' }
 }
 if ($LocalOnly) {
     Write-Output "LOCAL_ONLY: copied and hash-verified; no commit or push. Obsidian: $obsidianTarget"
